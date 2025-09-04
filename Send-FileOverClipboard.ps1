@@ -1,16 +1,30 @@
 <#
 .SYNOPSIS
-    ClipTunnel Sender (7z Edition)
+    ClipTunnel Sender (7z Edition with Splitting)
 .DESCRIPTION
-    Sends a file or folder over the clipboard in chunks. This version requires the
-    7-Zip command-line tool (7z.exe) for compression. It will first look for 7z.exe
-    in the system PATH, and if not found, will check the default install location.
+    Sends a file over the clipboard. Can optionally split the source archive into
+    smaller parts on disk before sending, making it ideal for very large files
+    in low-memory environments.
+.PARAMETER Path
+    The path to the file or folder to send.
+.PARAMETER ByPart
+    Switch to enable splitting the archive into smaller parts before sending.
+.PARAMETER PartSize
+    The size of each part (e.g., "10MB", "500KB"). Mandatory when -ByPart is used.
 #>
+[CmdletBinding(DefaultParameterSetName='Default')]
 param(
-    [Parameter(Mandatory=$true)]
+    [Parameter(Mandatory=$true, Position=0)]
     [string]$Path,
 
-    [int]$ChunkSize = 786432 # 768 KB
+    [Parameter(Mandatory=$false)]
+    [int]$ChunkSize = 786432, # 768 KB
+
+    [Parameter(ParameterSetName='Split')]
+    [switch]$ByPart,
+
+    [Parameter(ParameterSetName='Split', Mandatory=$true)]
+    [string]$PartSize
 )
 
 function Write-Log {
@@ -19,127 +33,119 @@ function Write-Log {
 }
 
 # --- PRE-FLIGHT CHECK: Find 7z.exe ---
+# (Same logic as before to find 7z.exe in PATH or default location)
 Write-Log "Searching for 7z.exe..." -Color Yellow
 $sevenZipPath = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
-
 if (-not $sevenZipPath) {
-    Write-Log "7z.exe not found in PATH. Checking default installation directory..." -Color Yellow
     $defaultPath = "C:\Program Files\7-Zip\7z.exe"
-    if (Test-Path $defaultPath) {
-        Write-Log "Found 7z.exe at default location: $defaultPath" -Color Green
-        $sevenZipPath = $defaultPath
-    }
-} else {
-    Write-Log "Found 7z.exe in PATH: $sevenZipPath" -Color Green
-}
+    if (Test-Path $defaultPath) { $sevenZipPath = $defaultPath; Write-Log "Found 7z.exe at default location." -Color Green }
+} else { Write-Log "Found 7z.exe in PATH." -Color Green }
 
 if (-not $sevenZipPath) {
-    Write-Log "FATAL: 7-Zip command-line tool (7z.exe) could not be found." -Color Red
-    Write-Log "Please install 7-Zip to its default location or add its directory to the PATH." -Color Red
-    return
+    Write-Log "FATAL: 7-Zip (7z.exe) could not be found." -Color Red; return
 }
 
-
-# --- 1. PREPARE THE ARCHIVE ---
+# --- 1. PREPARE THE MAIN ARCHIVE ---
+# (This part is mostly the same, it always creates one large initial archive)
 $sourceObject = Get-Item -Path $Path
-$archivePath = ""
+if (-not $sourceObject) { Write-Log "Error: Path '$Path' not found." -Color Red; return }
 
-if (-not $sourceObject) {
-    Write-Log "Error: Path '$Path' not found." -Color Red
-    return
-}
+$tempDir = Join-Path $env:TEMP ([System.Guid]::NewGuid().ToString())
+New-Item -Path $tempDir -ItemType Directory | Out-Null
+$archivePath = Join-Path $tempDir "$($sourceObject.Name).7z"
+$archiveFileName = Split-Path $archivePath -Leaf
 
-$needsArchiving = $true
-$baseName = $sourceObject.Name
-if ($sourceObject.Extension -eq ".7z") {
-    Write-Log "Input is already a .7z archive. Using it directly." -Color Green
+if ($sourceObject.Extension -eq ".7z" -and !$ByPart) {
+    Write-Log "Input is a .7z archive and not splitting. Using it directly." -Color Green
     $archivePath = $sourceObject.FullName
-    $needsArchiving = $false
+    $tempDir = Split-Path $archivePath -Parent
 } else {
-    Write-Log "Input will be archived using 7z.exe with LZMA2 compression." -Color Cyan
-    $archivePath = Join-Path $env:TEMP "$baseName.7z"
-}
-
-# Archive the source using 7z.exe for ultra compression
-if ($needsArchiving) {
-    if (Test-Path $archivePath) { Remove-Item $archivePath -Force }
     try {
-        # a = add to archive
-        # -t7z = archive type 7z
-        # -m0=lzma2 = algorithm
-        # -mx=9 = compression level (ultra)
-        # -mmt=on = multi-threading on
         $arguments = "a -t7z -m0=lzma2 -mx=9 -mmt=on `"$archivePath`" `"$Path`""
-        Write-Log "Executing: `"$sevenZipPath`" $arguments" -Color Yellow
-        
+        Write-Log "Creating main archive..." -Color Cyan
         Start-Process -FilePath $sevenZipPath -ArgumentList $arguments -Wait -NoNewWindow
-        
         if (-not (Test-Path $archivePath)) { throw "7z.exe failed to create the archive." }
-        Write-Log "Successfully created 7z archive at '$archivePath'" -Color Green
-    } catch {
-        Write-Log "Error creating archive: $_" -Color Red
-        return
-    }
+    } catch { Write-Log "Error creating archive: $_" -Color Red; return }
 }
 
-# --- 2. HASH AND CHUNK THE FILE ---
-Write-Log "Computing SHA256 hash for '$archivePath'..." -Color Yellow
+# --- 2. CALCULATE HASH (ALWAYS ON THE FULL, UN-SPLIT ARCHIVE) ---
+Write-Log "Computing SHA256 hash for the complete archive..." -Color Yellow
 $fileHash = (Get-FileHash -Path $archivePath -Algorithm SHA256).Hash
 Write-Log "SHA256 Hash: $fileHash" -Color Green
 
-$fileBytes = [System.IO.File]::ReadAllBytes($archivePath)
-$totalChunks = [System.Math]::Ceiling($fileBytes.Length / $ChunkSize)
-$archiveFileName = Split-Path $archivePath -Leaf
+# --- 3. GET FILE LIST TO SEND (EITHER 1 FILE OR MANY PARTS) ---
+$filesToSend = @()
+if ($ByPart) {
+    Write-Log "Splitting archive into parts of size $PartSize..." -Color Cyan
+    try {
+        # -v (volume) switch splits the archive.
+        $splitArgs = "a -t7z `"-v$($PartSize)`" `"$($archivePath).split`" `"$archivePath`""
+        Start-Process -FilePath $sevenZipPath -ArgumentList $splitArgs -Wait -NoNewWindow
+        $filesToSend = Get-ChildItem -Path "$tempDir" -Filter "$($archiveFileName).split.*" | Sort-Object Name
+        if ($filesToSend.Count -eq 0) { throw "7z.exe failed to create split parts." }
+        Write-Log "Archive split into $($filesToSend.Count) parts." -Color Green
+    } catch { Write-Log "Error splitting archive: $_" -Color Red; return }
+} else {
+    $filesToSend = @(Get-Item $archivePath)
+}
 
-Write-Log "File size: $($fileBytes.Length) bytes. Splitting into $totalChunks chunks." -Color Yellow
+# --- 4. ITERATE AND SEND EACH FILE (PART) ---
+$totalParts = $filesToSend.Count
+$partNumber = 1
+foreach ($file in $filesToSend) {
+    Write-Log "Preparing to send Part $partNumber/$totalParts: $($file.Name)" -Color Magenta
+    
+    # Use streaming for low memory usage
+    try {
+        $fileStream = [System.IO.File]::OpenRead($file.FullName)
+        $reader = [System.IO.BinaryReader]::new($fileStream)
+        $totalChunks = [System.Math]::Ceiling($fileStream.Length / $ChunkSize)
+        $chunkNumber = 1
 
-# --- 3. SEND CHUNKS WITH ACKNOWLEDGEMENT ---
-for ($i = 0; $i -lt $totalChunks; $i++) {
-    $chunkNumber = $i + 1
-    $offset = $i * $ChunkSize
-    $remainingBytes = $fileBytes.Length - $offset
-    $currentChunkSize = [System.Math]::Min($ChunkSize, $remainingBytes)
+        while ($fileStream.Position -lt $fileStream.Length) {
+            $bytesToRead = [System.Math]::Min($ChunkSize, $fileStream.Length - $fileStream.Position)
+            $chunkBytes = $reader.ReadBytes($bytesToRead)
+            $chunkBase64 = [System.Convert]::ToBase64String($chunkBytes)
 
-    $chunkBytes = $fileBytes[$offset..($offset + $currentChunkSize - 1)]
-    $chunkBase64 = [System.Convert]::ToBase64String($chunkBytes)
+            # --- METADATA PAYLOAD (NOW INCLUDES PART INFO) ---
+            $payload = @{
+                base_filename = $archiveFileName # Original archive name
+                part_filename = $file.Name       # Name of this specific part (e.g., archive.7z.001)
+                hash          = $fileHash        # Hash of the ORIGINAL archive
+                part_number   = $partNumber
+                total_parts   = $totalParts
+                chunk_number  = $chunkNumber
+                total_chunks  = $totalChunks
+                data          = $chunkBase64
+            } | ConvertTo-Json -Compress
 
-    $payload = @{
-        filename     = $archiveFileName
-        hash         = $fileHash
-        chunk_number = $chunkNumber
-        total_chunks = $totalChunks
-        data         = $chunkBase64
-    } | ConvertTo-Json -Compress
-
-    $ackReceived = $false
-    while (-not $ackReceived) {
-        Write-Log "Sending chunk $chunkNumber/$totalChunks..." -Color Cyan
-        Set-Clipboard -Value $payload
-        
-        $expectedAck = "ACK $chunkNumber"
-        Write-Log "Waiting for acknowledgement: '$expectedAck'" -Color Yellow
-        
-        $timeout = 0
-        while ($timeout -lt 300) {
-            $clipboardContent = Get-Clipboard
-            if ($clipboardContent -eq $expectedAck) {
-                Write-Log "ACK received for chunk $chunkNumber!" -Color Green
-                $ackReceived = $true
-                break
+            # --- ACK HANDSHAKE (UNCHANGED) ---
+            $ackReceived = $false
+            while (-not $ackReceived) {
+                Write-Log "Sending Part $partNumber Chunk $chunkNumber/$totalChunks..." -Color Cyan
+                Set-Clipboard -Value $payload
+                $expectedAck = "ACK P$($partNumber)C$($chunkNumber)"
+                Write-Log "Waiting for acknowledgement: '$expectedAck'" -Color Yellow
+                
+                $timeout = 0
+                while ($timeout -lt 300) {
+                    if ((Get-Clipboard) -eq $expectedAck) {
+                        Write-Log "ACK received!" -Color Green; $ackReceived = $true; break
+                    }
+                    Start-Sleep -Milliseconds 200; $timeout++
+                }
+                if (-not $ackReceived) { Write-Log "Timeout waiting for ACK. Retrying..." -Color Red }
             }
-            Start-Sleep -Milliseconds 200
-            $timeout++
-        }
-
-        if (-not $ackReceived) {
-             Write-Log "Timeout waiting for ACK for chunk $chunkNumber. Retrying..." -Color Red
+            $chunkNumber++
         }
     }
+    finally {
+        if ($reader) { $reader.Dispose() }
+        if ($fileStream) { $fileStream.Dispose() }
+    }
+    $partNumber++
 }
 
-Write-Log "File transfer complete for '$archiveFileName'." -Color Green
-
-if ($needsArchiving) {
-    Remove-Item $archivePath -Force
-    Write-Log "Cleaned up temporary archive."
-}
+Write-Log "All parts transferred successfully." -Color Green
+Remove-Item -Path $tempDir -Recurse -Force
+Write-Log "Cleaned up temporary files."

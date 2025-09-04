@@ -82,77 +82,58 @@ if ($needsArchiving) {
     }
 }
 
-# --- 2. HASH THE FILE AND PREPARE FOR STREAMING ---
+# --- 2. HASH AND CHUNK THE FILE ---
 Write-Log "Computing SHA256 hash for '$archivePath'..." -Color Yellow
 $fileHash = (Get-FileHash -Path $archivePath -Algorithm SHA256).Hash
 Write-Log "SHA256 Hash: $fileHash" -Color Green
 
-$fileInfo = Get-Item -Path $archivePath
-$fileSize = $fileInfo.Length
-$totalChunks = [System.Math]::Ceiling($fileSize / $ChunkSize)
-$archiveFileName = $fileInfo.Name
+$fileBytes = [System.IO.File]::ReadAllBytes($archivePath)
+$totalChunks = [System.Math]::Ceiling($fileBytes.Length / $ChunkSize)
+$archiveFileName = Split-Path $archivePath -Leaf
 
-Write-Log "File size: $fileSize bytes. Splitting into $totalChunks chunks." -Color Yellow
+Write-Log "File size: $($fileBytes.Length) bytes. Splitting into $totalChunks chunks." -Color Yellow
 
-# --- 3. STREAM CHUNKS WITH ACKNOWLEDGEMENT ---
-$chunkNumber = 0
-$fileStream = $null
-try {
-    $fileStream = New-Object System.IO.FileStream($archivePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read)
-    $buffer = New-Object byte[] $ChunkSize
+# --- 3. SEND CHUNKS WITH ACKNOWLEDGEMENT ---
+for ($i = 0; $i -lt $totalChunks; $i++) {
+    $chunkNumber = $i + 1
+    $offset = $i * $ChunkSize
+    $remainingBytes = $fileBytes.Length - $offset
+    $currentChunkSize = [System.Math]::Min($ChunkSize, $remainingBytes)
 
-    while ($bytesRead = $fileStream.Read($buffer, 0, $buffer.Length)) {
-        if ($bytesRead -eq 0) { break }
-        $chunkNumber++
+    $chunkBytes = $fileBytes[$offset..($offset + $currentChunkSize - 1)]
+    $chunkBase64 = [System.Convert]::ToBase64String($chunkBytes)
 
-        # For the last chunk, the buffer might be larger than the bytes read
-        $actualChunkBytes = if ($bytesRead -lt $buffer.Length) {
-            $temp = New-Object byte[] $bytesRead
-            [System.Array]::Copy($buffer, $temp, $bytesRead)
-            $temp
-        } else {
-            $buffer
-        }
+    $payload = @{
+        filename     = $archiveFileName
+        hash         = $fileHash
+        chunk_number = $chunkNumber
+        total_chunks = $totalChunks
+        data         = $chunkBase64
+    } | ConvertTo-Json -Compress
+
+    $ackReceived = $false
+    while (-not $ackReceived) {
+        Write-Log "Sending chunk $chunkNumber/$totalChunks..." -Color Cyan
+        Set-Clipboard -Value $payload
         
-        $chunkBase64 = [System.Convert]::ToBase64String($actualChunkBytes)
-
-        $payload = @{
-            filename     = $archiveFileName
-            hash         = $fileHash
-            chunk_number = $chunkNumber
-            total_chunks = $totalChunks
-            data         = $chunkBase64
-        } | ConvertTo-Json -Compress
-
-        $ackReceived = $false
-        while (-not $ackReceived) {
-            Write-Log "Sending chunk $chunkNumber/$totalChunks..." -Color Cyan
-            Set-Clipboard -Value $payload
-
-            $expectedAck = "ACK $chunkNumber"
-            Write-Log "Waiting for acknowledgement: '$expectedAck'" -Color Yellow
-
-            $timeout = 0
-            while ($timeout -lt 300) {
-                $clipboardContent = Get-Clipboard
-                if ($clipboardContent -eq $expectedAck) {
-                    Write-Log "ACK received for chunk $chunkNumber!" -Color Green
-                    $ackReceived = $true
-                    break
-                }
-                Start-Sleep -Milliseconds 200
-                $timeout++
+        $expectedAck = "ACK $chunkNumber"
+        Write-Log "Waiting for acknowledgement: '$expectedAck'" -Color Yellow
+        
+        $timeout = 0
+        while ($timeout -lt 300) {
+            $clipboardContent = Get-Clipboard
+            if ($clipboardContent -eq $expectedAck) {
+                Write-Log "ACK received for chunk $chunkNumber!" -Color Green
+                $ackReceived = $true
+                break
             }
-
-            if (-not $ackReceived) {
-                Write-Log "Timeout waiting for ACK for chunk $chunkNumber. Retrying..." -Color Red
-            }
+            Start-Sleep -Milliseconds 200
+            $timeout++
         }
-    }
-} finally {
-    if ($fileStream -ne $null) {
-        $fileStream.Close()
-        $fileStream.Dispose()
+
+        if (-not $ackReceived) {
+             Write-Log "Timeout waiting for ACK for chunk $chunkNumber. Retrying..." -Color Red
+        }
     }
 }
 

@@ -108,7 +108,6 @@ try {
 
         # Determine current dividing chunk
         $currentDividingChunk = [System.Math]::Floor($bytesSent / $DividingChunkSize) + 1
-
         $actualChunkBytes = if ($bytesRead -lt $buffer.Length) {
             $temp = New-Object byte[] $bytesRead
             [System.Array]::Copy($buffer, $temp, $bytesRead)
@@ -145,6 +144,7 @@ try {
                     Write-Log "ACK received for clipboard chunk $clipboardChunkNumber!" -Color Green
                     $ackReceived = $true
                     $bytesSent += $bytesRead
+
                     break
                 }
                 Start-Sleep -Milliseconds 200

@@ -1,16 +1,15 @@
 <#
 .SYNOPSIS
-    Sends a file or folder over the clipboard in chunks using tar.xz (LZMA) compression.
+    ClipTunnel Sender (7z Edition)
 .DESCRIPTION
-    This version is optimized for speed with a larger 768 KB chunk size, resulting
-    in a ~1 MB clipboard payload per transfer.
+    Sends a file or folder over the clipboard in chunks. This version requires the
+    7-Zip command-line tool (7z.exe) for compression. It will first look for 7z.exe
+    in the system PATH, and if not found, will check the default install location.
 #>
 param(
     [Parameter(Mandatory=$true)]
     [string]$Path,
 
-    # OPTIMIZATION: Chunk size increased to 768 KB for much faster transfers.
-    # This becomes ~1 MB of text after Base64 encoding.
     [int]$ChunkSize = 786432 # 768 KB
 )
 
@@ -18,6 +17,28 @@ function Write-Log {
     param([string]$Message, [string]$Color = "White")
     Write-Host "[$(Get-Date -Format 'HH:mm:ss')] $Message" -ForegroundColor $Color
 }
+
+# --- PRE-FLIGHT CHECK: Find 7z.exe ---
+Write-Log "Searching for 7z.exe..." -Color Yellow
+$sevenZipPath = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
+
+if (-not $sevenZipPath) {
+    Write-Log "7z.exe not found in PATH. Checking default installation directory..." -Color Yellow
+    $defaultPath = "C:\Program Files\7-Zip\7z.exe"
+    if (Test-Path $defaultPath) {
+        Write-Log "Found 7z.exe at default location: $defaultPath" -Color Green
+        $sevenZipPath = $defaultPath
+    }
+} else {
+    Write-Log "Found 7z.exe in PATH: $sevenZipPath" -Color Green
+}
+
+if (-not $sevenZipPath) {
+    Write-Log "FATAL: 7-Zip command-line tool (7z.exe) could not be found." -Color Red
+    Write-Log "Please install 7-Zip to its default location or add its directory to the PATH." -Color Red
+    return
+}
+
 
 # --- 1. PREPARE THE ARCHIVE ---
 $sourceObject = Get-Item -Path $Path
@@ -30,21 +51,31 @@ if (-not $sourceObject) {
 
 $needsArchiving = $true
 $baseName = $sourceObject.Name
-if ($sourceObject.Extension -in ".xz", ".txz") {
-    Write-Log "Input is already a .tar.xz archive. Using it directly." -Color Green
+if ($sourceObject.Extension -eq ".7z") {
+    Write-Log "Input is already a .7z archive. Using it directly." -Color Green
     $archivePath = $sourceObject.FullName
     $needsArchiving = $false
 } else {
-    Write-Log "Input will be archived using tar.exe with xz (LZMA) compression." -Color Cyan
-    $archivePath = Join-Path $env:TEMP "$baseName.tar.xz"
+    Write-Log "Input will be archived using 7z.exe with LZMA2 compression." -Color Cyan
+    $archivePath = Join-Path $env:TEMP "$baseName.7z"
 }
 
+# Archive the source using 7z.exe for ultra compression
 if ($needsArchiving) {
     if (Test-Path $archivePath) { Remove-Item $archivePath -Force }
     try {
-        Write-Log "Creating archive: tar -cJf '$archivePath' -C '$(Split-Path $Path)' '$(Split-Path $Path -Leaf)'" -Color Yellow
-        tar.exe -cJf $archivePath -C (Split-Path -Path $Path -Parent) $baseName
-        Write-Log "Successfully created tar.xz archive at '$archivePath'" -Color Green
+        # a = add to archive
+        # -t7z = archive type 7z
+        # -m0=lzma2 = algorithm
+        # -mx=9 = compression level (ultra)
+        # -mmt=on = multi-threading on
+        $arguments = "a -t7z -m0=lzma2 -mx=9 -mmt=on `"$archivePath`" `"$Path`""
+        Write-Log "Executing: `"$sevenZipPath`" $arguments" -Color Yellow
+        
+        Start-Process -FilePath $sevenZipPath -ArgumentList $arguments -Wait -NoNewWindow
+        
+        if (-not (Test-Path $archivePath)) { throw "7z.exe failed to create the archive." }
+        Write-Log "Successfully created 7z archive at '$archivePath'" -Color Green
     } catch {
         Write-Log "Error creating archive: $_" -Color Red
         return
@@ -52,7 +83,7 @@ if ($needsArchiving) {
 }
 
 # --- 2. HASH AND CHUNK THE FILE ---
-Write-Log "Computing SHA26 hash for '$archivePath'..." -Color Yellow
+Write-Log "Computing SHA256 hash for '$archivePath'..." -Color Yellow
 $fileHash = (Get-FileHash -Path $archivePath -Algorithm SHA256).Hash
 Write-Log "SHA256 Hash: $fileHash" -Color Green
 

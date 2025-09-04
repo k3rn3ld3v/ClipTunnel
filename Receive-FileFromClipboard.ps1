@@ -1,9 +1,10 @@
 <#
 .SYNOPSIS
-    Receives a file from the clipboard in chunks.
+    Receives a file from the clipboard using a streaming approach.
 .DESCRIPTION
-    Continuously polls the clipboard for file chunks and reassembles them.
-    Can optionally exit after a successful transfer.
+    Continuously polls the clipboard for file chunks and writes them directly
+    to a file stream, reassembling the file on the fly. This version is
+    compatible with the two-tiered sender.
 .PARAMETER OutputDir
     The directory where the final reassembled file will be saved.
 .PARAMETER ExitOnComplete
@@ -16,9 +17,7 @@ param(
     [switch]$ExitOnComplete
 )
 
-# --- FIX 1: Set the output encoding to UTF-8 to correctly display emojis ---
 $OutputEncoding = [System.Text.Encoding]::UTF8
-
 Add-Type -AssemblyName System.Windows.Forms
 
 function Write-Log {
@@ -32,8 +31,9 @@ if (-not (Test-Path $OutputDir)) {
 
 $session = @{}
 $lastClipboardContent = ""
+$expectedClipboardChunk = 1
 
-Write-Log "Receiver started. Monitoring clipboard..." -Color Green
+Write-Log "Receiver started. Monitoring clipboard for streamed file..." -Color Green
 if ($ExitOnComplete) { Write-Log "Script will exit after the next successful transfer." -Color Yellow }
 else { Write-Log "Press CTRL+C to stop." -Color Yellow }
 
@@ -47,63 +47,84 @@ while ($true) {
 
             try { $payload = $clipboardContent | ConvertFrom-Json } catch { continue }
 
-            if ($payload -and $payload.filename -and $payload.hash) {
+            if ($payload -and $payload.filename -and $payload.hash -and $payload.clipboard_chunk_number) {
                 
+                # --- SESSION INITIALIZATION (FIRST CHUNK) ---
                 if (-not $session.filename) {
+                    # Basic validation of the first chunk
+                    if ($payload.clipboard_chunk_number -ne 1) {
+                        Write-Log "Ignoring out-of-order chunk. Waiting for chunk #1 to start." -Color Magenta
+                        continue
+                    }
+
                     $session.filename = $payload.filename
                     $session.hash = $payload.hash
-                    $session.total_chunks = $payload.total_chunks
-                    $session.temp_dir = Join-Path $env:TEMP ([System.Guid]::NewGuid().ToString())
-                    $session.chunks_received = @{}
-                    New-Item -Path $session.temp_dir -ItemType Directory | Out-Null
-                    Write-Log "Receiving new file: $($session.filename)" -Color Cyan
+                    $session.total_clipboard_chunks = $payload.total_clipboard_chunks
+
+                    $session.temp_path = Join-Path $OutputDir "$($session.filename).incomplete"
+                    $session.final_path = Join-Path $OutputDir $session.filename
+
+                    if (Test-Path $session.temp_path) { Remove-Item $session.temp_path }
+                    if (Test-Path $session.final_path) { Remove-Item $session.final_path }
+
+                    $session.file_stream = [System.IO.FileStream]::new($session.temp_path, [System.IO.FileMode]::Create)
+
+                    Write-Log "Receiving new file: $($session.filename) ($($session.total_clipboard_chunks) clipboard chunks)" -Color Cyan
                 }
 
-                $chunkNumber = $payload.chunk_number
-                if (-not $session.chunks_received.ContainsKey($chunkNumber)) {
-                    Write-Log "Received chunk $chunkNumber/$($session.total_chunks)"
+                # --- CHUNK PROCESSING ---
+                $clipboardChunkNumber = $payload.clipboard_chunk_number
+
+                # Process only the chunk we are expecting, ensuring in-order assembly
+                if ($clipboardChunkNumber -eq $expectedClipboardChunk) {
+                    $logMsg = "Received Clipboard Chunk $clipboardChunkNumber/$($session.total_clipboard_chunks) (from Dividing Chunk $($payload.dividing_chunk_number)/$($payload.total_dividing_chunks))"
+                    Write-Log $logMsg
+
                     $chunkBytes = [System.Convert]::FromBase64String($payload.data)
-                    $chunkPath = Join-Path $session.temp_dir "chunk_$($chunkNumber.ToString('00000')).bin"
-                    [System.IO.File]::WriteAllBytes($chunkPath, $chunkBytes)
-                    $session.chunks_received[$chunkNumber] = $true
+                    $session.file_stream.Write($chunkBytes, 0, $chunkBytes.Length)
+
+                    $expectedClipboardChunk++
                 }
                 
-                $ackMessage = "ACK $chunkNumber"
+                # Always ACK the chunk number received, sender will handle retries if we miss one
+                $ackMessage = "ACK $clipboardChunkNumber"
                 [System.Windows.Forms.Clipboard]::SetText($ackMessage)
-                Write-Log "Sent acknowledgement: '$ackMessage'" -Color Yellow
+                # Write-Log "Sent acknowledgement: '$ackMessage'" -Color DarkGray # Reduce log noise
 
-                if ($session.chunks_received.Count -eq $session.total_chunks) {
-                    Write-Log "All chunks received! Reassembling file..." -Color Cyan
-                    $finalFilePath = Join-Path $OutputDir $session.filename
-                    if (Test-Path $finalFilePath) { Remove-Item $finalFilePath }
+                # --- FINALIZATION ---
+                if ($clipboardChunkNumber -eq $session.total_clipboard_chunks -and $expectedClipboardChunk -gt $session.total_clipboard_chunks) {
+                    Write-Log "All chunks received! Finalizing file..." -Color Cyan
 
-                    $fileStream = [System.IO.FileStream]::new($finalFilePath, [System.IO.FileMode]::Create)
-                    Get-ChildItem -Path $session.temp_dir | Sort-Object Name | ForEach-Object {
-                        $bytes = [System.IO.File]::ReadAllBytes($_.FullName)
-                        $fileStream.Write($bytes, 0, $bytes.Length)
-                    }
-                    $fileStream.Close(); $fileStream.Dispose()
+                    $session.file_stream.Close()
+                    $session.file_stream.Dispose()
                     
-                    $reassembledHash = (Get-FileHash -Path $finalFilePath -Algorithm SHA256).Hash
+                    $reassembledHash = (Get-FileHash -Path $session.temp_path -Algorithm SHA256).Hash
                     if ($reassembledHash -eq $session.hash) {
                         Write-Log "✅ SUCCESS: Hash matches! File transfer successful." -Color Green
+                        Rename-Item -Path $session.temp_path -NewName $session.filename
                         
-                        # --- FIX 2: Check for the -ExitOnComplete switch ---
                         if ($ExitOnComplete) {
                             Write-Log "Exiting as requested." -Color Green
                             break # Exit the 'while ($true)' loop
                         }
                     } else {
-                        Write-Log "❌ FAILURE: Hash mismatch!" -Color Red
+                        Write-Log "❌ FAILURE: Hash mismatch! Expected $($session.hash), got $reassembledHash" -Color Red
+                        Remove-Item $session.temp_path -Force
                     }
 
-                    Remove-Item -Path $session.temp_dir -Recurse -Force
+                    # Reset for next transfer
                     $session = @{}
+                    $expectedClipboardChunk = 1
                 }
             }
         }
     } catch {
         Write-Log "An error occurred: $($_.Exception.Message)" -Color Red
+        # Clean up on error
+        if ($session.file_stream) { $session.file_stream.Dispose() }
+        if ($session.temp_path -and (Test-Path $session.temp_path)) { Remove-Item $session.temp_path -Force }
+        $session = @{}
+        $expectedClipboardChunk = 1
     }
     
     Start-Sleep -Milliseconds 100

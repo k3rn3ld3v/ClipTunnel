@@ -1,16 +1,19 @@
 <#
 .SYNOPSIS
-    ClipTunnel Sender (7z Edition)
+    ClipTunnel Sender (7z Edition - Two-Tier Chunks)
 .DESCRIPTION
-    Sends a file or folder over the clipboard in chunks. This version requires the
-    7-Zip command-line tool (7z.exe) for compression. It will first look for 7z.exe
-    in the system PATH, and if not found, will check the default install location.
+    Sends a file or folder over the clipboard using a two-tiered chunking system.
+    The file is logically divided into large 'dividing chunks' for progress tracking,
+    and these are sent as smaller 'clipboard chunks' to fit the clipboard buffer.
+
+    This version requires the 7-Zip command-line tool (7z.exe) for compression.
 #>
 param(
     [Parameter(Mandatory=$true)]
     [string]$Path,
 
-    [int]$ChunkSize = 786432 # 768 KB
+    [long]$DividingChunkSize = 20MB, # Size for logical file division
+    [int]$ClipboardChunkSize = 1MB    # Size for the actual clipboard payload
 )
 
 function Write-Log {
@@ -60,20 +63,12 @@ if ($sourceObject.Extension -eq ".7z") {
     $archivePath = Join-Path $env:TEMP "$baseName.7z"
 }
 
-# Archive the source using 7z.exe for ultra compression
 if ($needsArchiving) {
     if (Test-Path $archivePath) { Remove-Item $archivePath -Force }
     try {
-        # a = add to archive
-        # -t7z = archive type 7z
-        # -m0=lzma2 = algorithm
-        # -mx=9 = compression level (ultra)
-        # -mmt=on = multi-threading on
         $arguments = "a -t7z -m0=lzma2 -mx=9 -mmt=on `"$archivePath`" `"$Path`""
         Write-Log "Executing: `"$sevenZipPath`" $arguments" -Color Yellow
-        
         Start-Process -FilePath $sevenZipPath -ArgumentList $arguments -Wait -NoNewWindow
-        
         if (-not (Test-Path $archivePath)) { throw "7z.exe failed to create the archive." }
         Write-Log "Successfully created 7z archive at '$archivePath'" -Color Green
     } catch {
@@ -89,23 +84,30 @@ Write-Log "SHA256 Hash: $fileHash" -Color Green
 
 $fileInfo = Get-Item -Path $archivePath
 $fileSize = $fileInfo.Length
-$totalChunks = [System.Math]::Ceiling($fileSize / $ChunkSize)
 $archiveFileName = $fileInfo.Name
 
-Write-Log "File size: $fileSize bytes. Splitting into $totalChunks chunks." -Color Yellow
+# Calculate total chunks for both tiers
+$totalDividingChunks = [System.Math]::Ceiling($fileSize / $DividingChunkSize)
+$totalClipboardChunks = [System.Math]::Ceiling($fileSize / $ClipboardChunkSize)
+
+Write-Log "File size: $fileSize bytes." -Color Yellow
+Write-Log "Logical divisions: $totalDividingChunks chunks of $DividingChunkSize bytes." -Color Yellow
+Write-Log "Clipboard transfer: $totalClipboardChunks chunks of $ClipboardChunkSize bytes." -Color Yellow
 
 # --- 3. STREAM CHUNKS WITH ACKNOWLEDGEMENT ---
-$chunkNumber = 0
+$clipboardChunkNumber = 0
+$bytesSent = 0
 $fileStream = $null
 try {
     $fileStream = New-Object System.IO.FileStream($archivePath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read)
-    $buffer = New-Object byte[] $ChunkSize
+    $buffer = New-Object byte[] $ClipboardChunkSize
 
     while ($bytesRead = $fileStream.Read($buffer, 0, $buffer.Length)) {
         if ($bytesRead -eq 0) { break }
-        $chunkNumber++
+        $clipboardChunkNumber++
 
-        # For the last chunk, the buffer might be larger than the bytes read
+        # Determine current dividing chunk
+        $currentDividingChunk = [System.Math]::Floor($bytesSent / $DividingChunkSize) + 1
         $actualChunkBytes = if ($bytesRead -lt $buffer.Length) {
             $temp = New-Object byte[] $bytesRead
             [System.Array]::Copy($buffer, $temp, $bytesRead)
@@ -117,27 +119,32 @@ try {
         $chunkBase64 = [System.Convert]::ToBase64String($actualChunkBytes)
 
         $payload = @{
-            filename     = $archiveFileName
-            hash         = $fileHash
-            chunk_number = $chunkNumber
-            total_chunks = $totalChunks
-            data         = $chunkBase64
+            filename                 = $archiveFileName
+            hash                     = $fileHash
+            dividing_chunk_number    = $currentDividingChunk
+            total_dividing_chunks    = $totalDividingChunks
+            clipboard_chunk_number   = $clipboardChunkNumber
+            total_clipboard_chunks   = $totalClipboardChunks
+            data                     = $chunkBase64
         } | ConvertTo-Json -Compress
 
         $ackReceived = $false
         while (-not $ackReceived) {
-            Write-Log "Sending chunk $chunkNumber/$totalChunks..." -Color Cyan
+            $logMsg = "Sending Clipboard Chunk $clipboardChunkNumber/$totalClipboardChunks (Part of Dividing Chunk $currentDividingChunk/$totalDividingChunks)..."
+            Write-Log $logMsg -Color Cyan
             Set-Clipboard -Value $payload
 
-            $expectedAck = "ACK $chunkNumber"
+            $expectedAck = "ACK $clipboardChunkNumber"
             Write-Log "Waiting for acknowledgement: '$expectedAck'" -Color Yellow
 
             $timeout = 0
             while ($timeout -lt 300) {
                 $clipboardContent = Get-Clipboard
                 if ($clipboardContent -eq $expectedAck) {
-                    Write-Log "ACK received for chunk $chunkNumber!" -Color Green
+                    Write-Log "ACK received for clipboard chunk $clipboardChunkNumber!" -Color Green
                     $ackReceived = $true
+                    $bytesSent += $bytesRead
+
                     break
                 }
                 Start-Sleep -Milliseconds 200
@@ -145,7 +152,7 @@ try {
             }
 
             if (-not $ackReceived) {
-                Write-Log "Timeout waiting for ACK for chunk $chunkNumber. Retrying..." -Color Red
+                Write-Log "Timeout waiting for ACK for clipboard chunk $clipboardChunkNumber. Retrying..." -Color Red
             }
         }
     }

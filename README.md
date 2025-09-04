@@ -1,4 +1,4 @@
-# 📋 PClip-Transfer
+# 📋 ClipTunnel
 
 A pair of PowerShell scripts for transferring files and folders out of a restricted environment (like a CTF VM) using only the VNC shared clipboard. This tool handles archiving, compression, chunking, and integrity checks automatically.
 

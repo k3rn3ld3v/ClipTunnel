@@ -1,16 +1,9 @@
 <#
 .SYNOPSIS
-    ClipTunnel Sender (7z Edition with Splitting)
+    ClipTunnel Sender (with Splitting Feature)
 .DESCRIPTION
     Sends a file over the clipboard. Can optionally split the source archive into
-    smaller parts on disk before sending, making it ideal for very large files
-    in low-memory environments.
-.PARAMETER Path
-    The path to the file or folder to send.
-.PARAMETER ByPart
-    Switch to enable splitting the archive into smaller parts before sending.
-.PARAMETER PartSize
-    The size of each part (e.g., "10MB", "500KB"). Mandatory when -ByPart is used.
+    smaller parts on disk before sending, making it ideal for very large files.
 #>
 [CmdletBinding(DefaultParameterSetName='Default')]
 param(
@@ -21,10 +14,10 @@ param(
     [int]$ChunkSize = 786432, # 768 KB
 
     [Parameter(ParameterSetName='Split')]
-    [switch]$ByPart,
+    [switch]$Split,
 
     [Parameter(ParameterSetName='Split', Mandatory=$true)]
-    [string]$PartSize
+    [string]$SplitSize
 )
 
 function Write-Log {
@@ -33,7 +26,6 @@ function Write-Log {
 }
 
 # --- PRE-FLIGHT CHECK: Find 7z.exe ---
-# (Same logic as before to find 7z.exe in PATH or default location)
 Write-Log "Searching for 7z.exe..." -Color Yellow
 $sevenZipPath = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source
 if (-not $sevenZipPath) {
@@ -46,7 +38,6 @@ if (-not $sevenZipPath) {
 }
 
 # --- 1. PREPARE THE MAIN ARCHIVE ---
-# (This part is mostly the same, it always creates one large initial archive)
 $sourceObject = Get-Item -Path $Path
 if (-not $sourceObject) { Write-Log "Error: Path '$Path' not found." -Color Red; return }
 
@@ -55,18 +46,13 @@ New-Item -Path $tempDir -ItemType Directory | Out-Null
 $archivePath = Join-Path $tempDir "$($sourceObject.Name).7z"
 $archiveFileName = Split-Path $archivePath -Leaf
 
-if ($sourceObject.Extension -eq ".7z" -and !$ByPart) {
-    Write-Log "Input is a .7z archive and not splitting. Using it directly." -Color Green
-    $archivePath = $sourceObject.FullName
-    $tempDir = Split-Path $archivePath -Parent
-} else {
-    try {
-        $arguments = "a -t7z -m0=lzma2 -mx=9 -mmt=on `"$archivePath`" `"$Path`""
-        Write-Log "Creating main archive..." -Color Cyan
-        Start-Process -FilePath $sevenZipPath -ArgumentList $arguments -Wait -NoNewWindow
-        if (-not (Test-Path $archivePath)) { throw "7z.exe failed to create the archive." }
-    } catch { Write-Log "Error creating archive: $_" -Color Red; return }
-}
+try {
+    $arguments = "a -t7z -m0=lzma2 -mx=9 -mmt=on `"$archivePath`" `"$Path`""
+    Write-Log "Creating main archive..." -Color Cyan
+    Start-Process -FilePath $sevenZipPath -ArgumentList $arguments -Wait -NoNewWindow
+    if (-not (Test-Path $archivePath)) { throw "7z.exe failed to create the archive." }
+} catch { Write-Log "Error creating archive: $_" -Color Red; return }
+
 
 # --- 2. CALCULATE HASH (ALWAYS ON THE FULL, UN-SPLIT ARCHIVE) ---
 Write-Log "Computing SHA256 hash for the complete archive..." -Color Yellow
@@ -75,11 +61,15 @@ Write-Log "SHA256 Hash: $fileHash" -Color Green
 
 # --- 3. GET FILE LIST TO SEND (EITHER 1 FILE OR MANY PARTS) ---
 $filesToSend = @()
-if ($ByPart) {
-    Write-Log "Splitting archive into parts of size $PartSize..." -Color Cyan
+if ($Split) {
+    Write-Log "Splitting archive into parts of size $SplitSize..." -Color Cyan
     try {
-        # -v (volume) switch splits the archive.
-        $splitArgs = "a -t7z `"-v$($PartSize)`" `"$($archivePath).split`" `"$archivePath`""
+        # --- FIX: Format the SplitSize for 7-Zip (e.g., "10MB" -> "10m") ---
+        $formattedSplitSize = $SplitSize.ToLower().Trim() -replace 'b$'
+        
+        # The -v (volume) switch splits the archive.
+        $splitBasePath = "$($archivePath).split"
+        $splitArgs = "a -t7z `"-v$($formattedSplitSize)`" `"$splitBasePath`" `"$archivePath`""
         Start-Process -FilePath $sevenZipPath -ArgumentList $splitArgs -Wait -NoNewWindow
         $filesToSend = Get-ChildItem -Path "$tempDir" -Filter "$($archiveFileName).split.*" | Sort-Object Name
         if ($filesToSend.Count -eq 0) { throw "7z.exe failed to create split parts." }
@@ -93,9 +83,9 @@ if ($ByPart) {
 $totalParts = $filesToSend.Count
 $partNumber = 1
 foreach ($file in $filesToSend) {
-    Write-Log "Preparing to send Part $partNumber/$totalParts: $($file.Name)" -Color Magenta
+    $logMessage = "Preparing to send Part $partNumber/$totalParts: $($file.Name)"
+    Write-Log $logMessage -Color Magenta
     
-    # Use streaming for low memory usage
     try {
         $fileStream = [System.IO.File]::OpenRead($file.FullName)
         $reader = [System.IO.BinaryReader]::new($fileStream)
@@ -107,11 +97,10 @@ foreach ($file in $filesToSend) {
             $chunkBytes = $reader.ReadBytes($bytesToRead)
             $chunkBase64 = [System.Convert]::ToBase64String($chunkBytes)
 
-            # --- METADATA PAYLOAD (NOW INCLUDES PART INFO) ---
             $payload = @{
-                base_filename = $archiveFileName # Original archive name
-                part_filename = $file.Name       # Name of this specific part (e.g., archive.7z.001)
-                hash          = $fileHash        # Hash of the ORIGINAL archive
+                base_filename = $archiveFileName
+                part_filename = $file.Name
+                hash          = $fileHash
                 part_number   = $partNumber
                 total_parts   = $totalParts
                 chunk_number  = $chunkNumber
@@ -119,7 +108,6 @@ foreach ($file in $filesToSend) {
                 data          = $chunkBase64
             } | ConvertTo-Json -Compress
 
-            # --- ACK HANDSHAKE (UNCHANGED) ---
             $ackReceived = $false
             while (-not $ackReceived) {
                 Write-Log "Sending Part $partNumber Chunk $chunkNumber/$totalChunks..." -Color Cyan

@@ -15,7 +15,14 @@ param(
 $OutputEncoding = [System.Text.Encoding]::UTF8
 Add-Type -AssemblyName System.Windows.Forms
 
-function Write-Log { param([string]$Message, [string]$Color="White") { Write-Host "[$(Get-Date -Format 'HH:mm:ss')] $Message" -ForegroundColor $Color } }
+function Write-Log {
+    param(
+        [string]$Message,
+        [string]$Color="White"
+    )
+    Write-Host "[$(Get-Date -Format 'HH:mm:ss')] $Message" -ForegroundColor $Color
+}
+
 if (-not (Test-Path $OutputDir)) { New-Item -Path $OutputDir -ItemType Directory | Out-Null }
 
 # --- ENHANCED STATE MANAGEMENT ---
@@ -99,8 +106,8 @@ while ($true) {
 
                     $fileStream = [System.IO.FileStream]::new($finalFilePath, [System.IO.FileMode]::Create)
                     Get-ChildItem -Path $session.main_temp_dir -Filter "*.split.*" | Sort-Object Name | ForEach-Object {
-                        $bytes = [System.IO.File]::ReadAllBytes($_.FullName)
-                        $fileStream.Write($bytes, 0, $bytes.Length)
+                        $partBytes = [System.IO.File]::ReadAllBytes($_.FullName)
+                        $fileStream.Write($partBytes, 0, $partBytes.Length)
                     }
                     $fileStream.Close(); $fileStream.Dispose()
                     

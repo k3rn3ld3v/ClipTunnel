@@ -1,24 +1,35 @@
 <#
 .SYNOPSIS
-    ClipTunnel Receiver (with Part Reassembly)
+    Receives a file from the clipboard in chunks.
 .DESCRIPTION
-    Receives file chunks from the clipboard. Automatically handles multi-part
-    archives, reassembling parts first, then combining them into the final file
-    before hash verification.
+    Continuously polls the clipboard for file chunks and reassembles them.
+    Can optionally exit after a successful transfer.
+.PARAMETER OutputDir
+    The directory where the final reassembled file will be saved.
+.PARAMETER ExitOnComplete
+    If specified, the script will automatically exit after one successful file transfer.
 #>
 param(
     [Parameter(Mandatory=$true)]
     [string]$OutputDir,
+
     [switch]$ExitOnComplete
 )
 
+# --- FIX 1: Set the output encoding to UTF-8 to correctly display emojis ---
 $OutputEncoding = [System.Text.Encoding]::UTF8
+
 Add-Type -AssemblyName System.Windows.Forms
 
-function Write-Log { param([string]$Message, [string]$Color="White") { Write-Host "[$(Get-Date -Format 'HH:mm:ss')] $Message" -ForegroundColor $Color } }
-if (-not (Test-Path $OutputDir)) { New-Item -Path $OutputDir -ItemType Directory | Out-Null }
+function Write-Log {
+    param([string]$Message, [string]$Color = "White")
+    Write-Host "[$(Get-Date -Format 'HH:mm:ss')] $Message" -ForegroundColor $Color
+}
 
-# --- ENHANCED STATE MANAGEMENT ---
+if (-not (Test-Path $OutputDir)) {
+    New-Item -Path $OutputDir -ItemType Directory | Out-Null
+}
+
 $session = @{}
 $lastClipboardContent = ""
 
@@ -29,93 +40,71 @@ else { Write-Log "Press CTRL+C to stop." -Color Yellow }
 while ($true) {
     try {
         $clipboardContent = [System.Windows.Forms.Clipboard]::GetText()
+        
         if ($clipboardContent -and $clipboardContent -ne $lastClipboardContent) {
             $lastClipboardContent = $clipboardContent
+            $payload = $null
+
             try { $payload = $clipboardContent | ConvertFrom-Json } catch { continue }
 
-            if ($payload -and $payload.base_filename) {
-                # --- Part 1: Initialize Session on first-ever chunk ---
-                if (-not $session.base_filename) {
-                    $session = @{
-                        base_filename    = $payload.base_filename
-                        hash             = $payload.hash
-                        total_parts      = $payload.total_parts
-                        main_temp_dir    = Join-Path $env:TEMP ([System.Guid]::NewGuid().ToString())
-                        parts_completed  = @{}
-                        current_part     = $null
-                    }
-                    New-Item -Path $session.main_temp_dir -ItemType Directory | Out-Null
-                    Write-Log "Receiving new file: $($session.base_filename) ($($session.total_parts) parts total)" -Color Cyan
+            if ($payload -and $payload.filename -and $payload.hash) {
+                
+                if (-not $session.filename) {
+                    $session.filename = $payload.filename
+                    $session.hash = $payload.hash
+                    $session.total_chunks = $payload.total_chunks
+                    $session.temp_dir = Join-Path $env:TEMP ([System.Guid]::NewGuid().ToString())
+                    $session.chunks_received = @{}
+                    New-Item -Path $session.temp_dir -ItemType Directory | Out-Null
+                    Write-Log "Receiving new file: $($session.filename)" -Color Cyan
                 }
 
-                # --- Part 2: Handle the current part's chunks ---
-                if (($null -eq $session.current_part) -or ($session.current_part.part_filename -ne $payload.part_filename)) {
-                    $session.current_part = @{
-                        part_filename = $payload.part_filename
-                        part_number   = $payload.part_number
-                        total_chunks  = $payload.total_chunks
-                        chunk_temp_dir= Join-Path $session.main_temp_dir "part_$($payload.part_number)"
-                        chunks_saved  = @{}
-                    }
-                    New-Item -Path $session.current_part.chunk_temp_dir -ItemType Directory | Out-Null
-                    Write-Log "Receiving Part $($payload.part_number)/$($session.total_parts): $($payload.part_filename)" -Color Magenta
-                }
-                
                 $chunkNumber = $payload.chunk_number
-                if (-not $session.current_part.chunks_saved.ContainsKey($chunkNumber)) {
-                    Write-Log "Saving Part $($payload.part_number) Chunk $chunkNumber/$($session.current_part.total_chunks)..."
+                if (-not $session.chunks_received.ContainsKey($chunkNumber)) {
+                    Write-Log "Received chunk $chunkNumber/$($session.total_chunks)"
                     $chunkBytes = [System.Convert]::FromBase64String($payload.data)
-                    $chunkPath = Join-Path $session.current_part.chunk_temp_dir "chunk_$($chunkNumber.ToString('00000')).bin"
+                    $chunkPath = Join-Path $session.temp_dir "chunk_$($chunkNumber.ToString('00000')).bin"
                     [System.IO.File]::WriteAllBytes($chunkPath, $chunkBytes)
-                    $session.current_part.chunks_saved[$chunkNumber] = $true
+                    $session.chunks_received[$chunkNumber] = $true
                 }
-
-                # --- Send ACK (now includes Part and Chunk number) ---
-                $ackMessage = "ACK P$($payload.part_number)C$($chunkNumber)"
-                [System.Windows.Forms.Clipboard]::SetText($ackMessage)
                 
-                # --- Part 3: Reassemble the CURRENT PART if all its chunks are received ---
-                if ($session.current_part.chunks_saved.Count -eq $session.current_part.total_chunks) {
-                    Write-Log "All chunks for Part $($session.current_part.part_number) received. Reassembling part..." -Color Yellow
-                    $reassembledPartPath = Join-Path $session.main_temp_dir $session.current_part.part_filename
-                    $fileStream = [System.IO.FileStream]::new($reassembledPartPath, [System.IO.FileMode]::Create)
-                    Get-ChildItem -Path $session.current_part.chunk_temp_dir | Sort-Object Name | ForEach-Object {
-                        $bytes = [System.IO.File]::ReadAllBytes($_.FullName)
-                        $fileStream.Write($bytes, 0, $bytes.Length)
-                    }
-                    $fileStream.Close(); $fileStream.Dispose()
-                    
-                    Remove-Item -Path $session.current_part.chunk_temp_dir -Recurse -Force
-                    $session.parts_completed[$session.current_part.part_number] = $true
-                    $session.current_part = $null # Reset to receive the next part
-                    Write-Log "Part reassembled successfully." -Color Green
-                }
+                $ackMessage = "ACK $chunkNumber"
+                [System.Windows.Forms.Clipboard]::SetText($ackMessage)
+                Write-Log "Sent acknowledgement: '$ackMessage'" -Color Yellow
 
-                # --- Part 4: Reassemble the FINAL ARCHIVE if all parts are completed ---
-                if ($session.parts_completed.Count -eq $session.total_parts) {
-                    Write-Log "All parts received! Reassembling final archive..." -Color Cyan
-                    $finalFilePath = Join-Path $OutputDir $session.base_filename
+                if ($session.chunks_received.Count -eq $session.total_chunks) {
+                    Write-Log "All chunks received! Reassembling file..." -Color Cyan
+                    $finalFilePath = Join-Path $OutputDir $session.filename
                     if (Test-Path $finalFilePath) { Remove-Item $finalFilePath }
 
                     $fileStream = [System.IO.FileStream]::new($finalFilePath, [System.IO.FileMode]::Create)
-                    Get-ChildItem -Path $session.main_temp_dir -Filter "*.split.*" | Sort-Object Name | ForEach-Object {
+                    Get-ChildItem -Path $session.temp_dir | Sort-Object Name | ForEach-Object {
                         $bytes = [System.IO.File]::ReadAllBytes($_.FullName)
                         $fileStream.Write($bytes, 0, $bytes.Length)
                     }
                     $fileStream.Close(); $fileStream.Dispose()
                     
-                    # --- Final Hash Verification ---
                     $reassembledHash = (Get-FileHash -Path $finalFilePath -Algorithm SHA256).Hash
                     if ($reassembledHash -eq $session.hash) {
-                        Write-Log "✅ SUCCESS: Hash matches! Final file is valid." -Color Green
-                        if ($ExitOnComplete) { Write-Log "Exiting."; break }
-                    } else { Write-Log "❌ FAILURE: Hash mismatch!" -Color Red }
+                        Write-Log "✅ SUCCESS: Hash matches! File transfer successful." -Color Green
+                        
+                        # --- FIX 2: Check for the -ExitOnComplete switch ---
+                        if ($ExitOnComplete) {
+                            Write-Log "Exiting as requested." -Color Green
+                            break # Exit the 'while ($true)' loop
+                        }
+                    } else {
+                        Write-Log "❌ FAILURE: Hash mismatch!" -Color Red
+                    }
 
-                    Remove-Item -Path $session.main_temp_dir -Recurse -Force
-                    $session = @{} # Reset for next transfer
+                    Remove-Item -Path $session.temp_dir -Recurse -Force
+                    $session = @{}
                 }
             }
         }
-    } catch { Write-Log "An error occurred: $($_.Exception.Message)" -Color Red }
+    } catch {
+        Write-Log "An error occurred: $($_.Exception.Message)" -Color Red
+    }
+    
     Start-Sleep -Milliseconds 100
 }

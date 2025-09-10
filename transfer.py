@@ -1,4 +1,4 @@
-# transfer.py (v6 - Final Bidirectional Script)
+# transfer.py (v6.1 - Bidirectional with ACK Retry)
 import argparse
 import base64
 import hashlib
@@ -23,6 +23,8 @@ IS_LINUX = platform.system() == "Linux"
 
 CHUNK_SIZE = 120 * 1024
 ACK_TIMEOUT_SECONDS = 15
+ACK_RETRY_COUNT = 5
+ACK_RETRY_DELAY_SECONDS = 0.5
 
 # --- OS-Aware Clipboard Abstraction ---
 CLIPBOARD_TOOL_LINUX = None
@@ -80,7 +82,6 @@ def find_executable(name, default_paths=[]):
     return None
 
 def detect_archiver():
-    """Finds the best available archiver for the current OS."""
     seven_zip_paths = [r"C:\Program Files\7-Zip", r"C:\Program Files (x86)\7-Zip"]
     git_bin_paths = [r"C:\Program Files\Git\usr\bin"]
     
@@ -186,9 +187,25 @@ def run_receive_mode(output_filename):
                     stored_chunks[chunk_num] = payload
                     print(f"📥 Received chunk {chunk_num}/{total_chunks}. Sending ACK...")
                 
+                # --- NEW: ACK Send and Verify Loop ---
                 ack_packet = json.dumps({"type": "ack", "ack_num": chunk_num})
-                copy_to_clipboard(ack_packet)
-                last_cb_content = ack_packet
+                ack_sent_successfully = False
+                for i in range(ACK_RETRY_COUNT):
+                    copy_to_clipboard(ack_packet)
+                    time.sleep(0.1) # Give clipboard a moment to update
+                    if paste_from_clipboard() == ack_packet:
+                        ack_sent_successfully = True
+                        break
+                    else:
+                        print(f"    - ACK send failed. Retrying ({i+1}/{ACK_RETRY_COUNT})...")
+                        time.sleep(ACK_RETRY_DELAY_SECONDS)
+                
+                if ack_sent_successfully:
+                    last_cb_content = ack_packet
+                else:
+                    print(f"    - ❌ CRITICAL: Failed to send ACK for chunk {chunk_num} after retries.")
+                # --- End of new logic ---
+
             except (json.JSONDecodeError, KeyError, TypeError): pass
             if total_chunks != -1 and len(stored_chunks) == total_chunks: print("\n✅ All chunks received."); break
             time.sleep(1)
@@ -239,7 +256,7 @@ if __name__ == "__main__":
     # Clear clipboard on start to ensure a clean state
     print("🧹 Clearing clipboard for a clean start...")
     copy_to_clipboard('')
-    time.sleep(0.5) # Small delay for the OS to process the clipboard change
+    time.sleep(0.5)
 
     if args.mode == 'send':
         run_send_mode(args.file, args.archive)

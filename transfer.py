@@ -1,4 +1,4 @@
-# transfer.py (v6.1 - Bidirectional with ACK Retry)
+# transfer.py (v6.2 - Bidirectional with Send-Side Paste Verification)
 import argparse
 import base64
 import hashlib
@@ -25,6 +25,9 @@ CHUNK_SIZE = 120 * 1024
 ACK_TIMEOUT_SECONDS = 15
 ACK_RETRY_COUNT = 5
 ACK_RETRY_DELAY_SECONDS = 0.5
+PASTE_RETRY_COUNT = 5
+PASTE_RETRY_DELAY_SECONDS = 0.5
+
 
 # --- OS-Aware Clipboard Abstraction ---
 CLIPBOARD_TOOL_LINUX = None
@@ -138,7 +141,25 @@ def run_send_mode(file_path, use_archive):
                 payload = base64_string[start:end]
                 payload_hash = hashlib.sha256(payload.encode('utf-8')).hexdigest()
                 packet = json.dumps({"type": "data", "chunk_num": chunk_num, "total_chunks": total_chunks, "original_file_hash": file_hash, "archive_type": archive_type, "hash": payload_hash, "payload": payload})
-                copy_to_clipboard(packet)
+                
+                # --- NEW: Clipboard Paste Verification Loop ---
+                paste_verified = False
+                for attempt in range(PASTE_RETRY_COUNT):
+                    copy_to_clipboard(packet)
+                    time.sleep(0.1)  # Give clipboard a moment to settle
+                    pasted_content = paste_from_clipboard()
+                    if pasted_content == packet:
+                        paste_verified = True
+                        break
+                    else:
+                        print(f"    - Clipboard paste mismatch on attempt {attempt + 1}/{PASTE_RETRY_COUNT}. Retrying paste...")
+                        time.sleep(PASTE_RETRY_DELAY_SECONDS)
+                
+                if not paste_verified:
+                    print(f"    - ❌ CRITICAL: Failed to verify clipboard content for chunk {chunk_num} after retries. Aborting.")
+                    return
+                # --- End of new logic ---
+
                 print(f"\n📤 Sending chunk {chunk_num}/{total_chunks}...")
                 
                 start_time = time.time()

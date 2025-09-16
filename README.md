@@ -35,28 +35,28 @@ The script transfer.py has two main modes: send and receive.
 ### **Example 1: Windows (Sender) to Linux (Receiver)**
 
 1. **On the Linux (Receiver) machine**, run:  
-   ```python3 transfer.py receive \-o my\_received\_file.ext```
+   ```python3 transfer.py receive -o my_received_file.ext```
 
    The script will start listening.  
 2. **On the Windows (Sender) machine**, run:  
-   ```python transfer.py send \-f "C:\\path\\to\\my\_package.ext"```
+   ```python transfer.py send \-f "C:\path\to\my_package.ext"```
 
    Press Enter to start, then immediately click on the Linux remote session window to give it focus.
 
 ### **Example 2: Linux (Sender) to Windows (Receiver)**
 
 1. **On the Windows (Receiver) machine**, open a terminal and run:  
-   ```python transfer.py receive \-o my\_file.ext```
+   ```python transfer.py receive -o my_file.ext```
 
 2. **On the Linux (Sender) machine**, run:  
-   ```python3 transfer.py send \-f /home/user/scripts/my\_file.ext```
+   ```python3 transfer.py send -f /home/user/scripts/my_file.ext```
 
 ### **Compressing Files for Faster Transfer**
 
 To automatically find the best archiver (7z, tar.xz, zip) and compress the file before sending, just add the \-a or \--archive flag to the **send** command. The receiver will handle it automatically.
 
 \# Example: Send a large file with maximum compression  
-```python transfer.py send \-f "big\_log\_file.txt" \--archive```
+```python transfer.py send -f "big_log_file.txt" --archive```
 
 ## **⚙️ How It Works**
 
